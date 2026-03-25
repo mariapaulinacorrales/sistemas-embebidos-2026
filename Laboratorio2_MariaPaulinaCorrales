@@ -1,0 +1,660 @@
+// Juego: Atrapa la estrella
+// Un punto VERDE cae de arriba a abajo por una columna aleatoria
+// Una canasta ROJA está en la fila 7 (penúltima fila)
+// El botón mueve la canasta 1 columna a la derecha
+// Si la canasta atrapa el punto → parpadeo verde (éxito)
+// Si no lo atrapa → parpadeo rojo (fallo)
+//
+// Matriz de ÁNODO COMÚN por filas, CÁTODO COMÚN por columnas
+// Sin transistores → cátodo directo al GPIO
+//   Fila activa   → GPIO=1 (ánodo en HIGH)
+//   LED encendido → GPIO=0 (cátodo en LOW,  lógica negada)
+//   LED apagado   → GPIO=1 (cátodo en HIGH, lógica negada)
+
+#include <stdio.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/timer.h"
+#include "esp_task_wdt.h"
+
+// ================================================================
+// PINES DE LAS 8 FILAS (ÁNODOS)
+// PIN de la matriz → GPIO del ESP32
+// GPIO=1 → fila activa
+// GPIO=0 → fila inactiva
+// ================================================================
+#define ROW1 13  // PIN22 → Fila 1 (arriba)
+#define ROW2 12  // PIN19 → Fila 2
+#define ROW3 14  // PIN16 → Fila 3
+#define ROW4 27  // PIN13 → Fila 4
+#define ROW5 26  // PIN3  → Fila 5
+#define ROW6 25  // PIN6  → Fila 6
+#define ROW7 33  // PIN9  → Fila 7
+#define ROW8 32  // PIN12 → Fila 8 (abajo)
+
+// ================================================================
+// PINES DE LAS 8 COLUMNAS ROJAS (CÁTODOS directos)
+// GPIO=0 → cátodo a GND → LED ROJO ENCIENDE (lógica negada)
+// GPIO=1 → cátodo a HIGH → LED ROJO APAGADO
+// ================================================================
+#define COL_R1 23  // PIN24 → Col 1 roja
+#define COL_R2 22  // PIN21 → Col 2 roja
+#define COL_R3 21  // PIN18 → Col 3 roja
+#define COL_R4 3   // PIN15 → Col 4 roja
+#define COL_R5 1   // PIN1  → Col 5 roja
+#define COL_R6 36  // PIN4  → Col 6 roja
+#define COL_R7 35  // PIN7  → Col 7 roja
+#define COL_R8 34  // PIN10 → Col 8 roja
+
+// ================================================================
+// PINES DE LAS 8 COLUMNAS VERDES (CÁTODOS directos)
+// GPIO=0 → LED VERDE ENCIENDE (lógica negada)
+// GPIO=1 → LED VERDE APAGADO
+// ================================================================
+#define COL_G1 19  // PIN23 → Col 1 verde
+#define COL_G2 18  // PIN20 → Col 2 verde
+#define COL_G3 5   // PIN17 → Col 3 verde
+#define COL_G4 17  // PIN14 → Col 4 verde
+#define COL_G5 16  // PIN2  → Col 5 verde
+#define COL_G6 4   // PIN5  → Col 6 verde
+#define COL_G7 2   // PIN8  → Col 7 verde
+#define COL_G8 15  // PIN11 → Col 8 verde
+
+// ================================================================
+// BOTÓN
+// GPIO39 → pull-up interno habilitado
+// No presionado → HIGH, Presionado → LOW
+// ================================================================
+#define BTN 39
+
+// ================================================================
+// TIEMPOS
+// ================================================================
+#define DOS_MS      2000ULL   // 2ms por fila → ciclo 16ms = 62Hz
+                               // Suficiente para no ver parpadeo ✅
+                               // Más tiempo que 1ms → el while alcanza
+                               // a procesar cada fila correctamente
+
+#define TICK_CAIDA  400000ULL // 400ms → velocidad de caída del punto
+                               // El punto baja 1 fila cada 400ms
+                               // 8 filas x 400ms = 3.2 segundos por caída
+                               // Tiempo suficiente para reaccionar ✅
+
+#define TICK_CANASTA 300000ULL // 300ms → velocidad de respuesta del botón
+                                // Cada 300ms se acepta una nueva pulsación
+                                // Evita que el botón mueva demasiado rápido
+
+#define DEBOUNCE_US  200000ULL // 200ms antirebote
+
+#define TICKS_ANIMACION 6      // 6 ticks x 400ms = 2.4 segundos de animación
+                                // Tiempo que dura el parpadeo de éxito o fallo
+
+// ================================================================
+// VALORES DEL BUFFER DE PANTALLA
+// ================================================================
+#define APAGADO 0
+#define ROJO    1  // Canasta
+#define VERDE   2  // Punto que cae
+
+// ================================================================
+// ESTADOS DEL JUEGO
+// ================================================================
+#define ESTADO_JUGANDO  0  // Juego activo: punto cae, botón mueve canasta
+#define ESTADO_EXITO    1  // Canasta atrapó el punto → parpadeo verde
+#define ESTADO_FALLO    2  // Canasta no atrapó → parpadeo rojo
+
+// ================================================================
+// BUFFER DE PANTALLA
+// screen[fila][columna] → 0=apagado, 1=rojo, 2=verde
+// El juego escribe aquí cada tick
+// La multiplexación lee aquí cada 2ms y lo muestra en la matriz
+// ================================================================
+static uint8_t screen[8][8] = {0};
+
+// ================================================================
+// VARIABLES VOLÁTILES
+// ================================================================
+static volatile bool bandera_boton     = false; // Botón presionado
+static volatile bool bandera_tick      = false; // Timer → actualizar juego
+static volatile bool bandera_multiplex = false; // Timer → cambiar fila
+static volatile uint64_t ultimo_btn    = 0;     // Antirebote
+
+static volatile int fila_actual = 0;
+// Fila que muestra la multiplexación ahora mismo (0 a 7)
+// Cicla: 0→1→2→3→4→5→6→7→0→...
+
+// ================================================================
+// ISR DEL BOTÓN
+// ================================================================
+static void IRAM_ATTR isr_boton(void *arg) {
+    uint64_t ahora = 0;
+    timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &ahora);
+    if (ahora - ultimo_btn >= DEBOUNCE_US) {
+        bandera_boton = true;
+        ultimo_btn = ahora;
+    }
+}
+
+// ================================================================
+// ISR DEL TIMER 0 (TICK DEL JUEGO cada 400ms)
+// Controla la velocidad de caída del punto y la animación
+// ================================================================
+static bool IRAM_ATTR timer_isr_juego(void *arg) {
+    bandera_tick = true;
+    return true;
+}
+
+// ================================================================
+// ISR DEL TIMER_GROUP_1/TIMER_0 (MULTIPLEXACIÓN cada 2ms)
+// ================================================================
+static bool IRAM_ATTR timer_isr_multiplex(void *arg) {
+    bandera_multiplex = true;
+    return true;
+}
+
+void app_main(void) {
+
+    // ================================================================
+    // WATCHDOG TIMER
+    // ================================================================
+    const esp_task_wdt_config_t wdt_cfg = {
+        .timeout_ms = 5000,
+        .idle_core_mask = 0,
+        .trigger_panic = true
+    };
+    esp_task_wdt_init(&wdt_cfg);
+    esp_task_wdt_add(NULL);
+
+    // ================================================================
+    // CONFIGURAR LAS 8 FILAS como salidas → inicio en LOW
+    // ================================================================
+    gpio_config_t cfg_row1 = { 
+        .pin_bit_mask = (1ULL << ROW1), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row1); 
+    gpio_set_level(ROW1, 0);
+
+    gpio_config_t cfg_row2 = { 
+        .pin_bit_mask = (1ULL << ROW2), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row2); 
+    gpio_set_level(ROW2, 0);
+
+    gpio_config_t cfg_row3 = { 
+        .pin_bit_mask = (1ULL << ROW3), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row3); 
+    gpio_set_level(ROW3, 0);
+
+    gpio_config_t cfg_row4 = { 
+        .pin_bit_mask = (1ULL << ROW4), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row4); 
+    gpio_set_level(ROW4, 0);
+
+    gpio_config_t cfg_row5 = { 
+        .pin_bit_mask = (1ULL << ROW5), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row5);
+    gpio_set_level(ROW5, 0);
+
+    gpio_config_t cfg_row6 = { 
+        .pin_bit_mask = (1ULL << ROW6), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&cfg_row6); 
+    gpio_set_level(ROW6, 0);
+
+    gpio_config_t cfg_row7 = { 
+        .pin_bit_mask = (1ULL << ROW7), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row7); 
+    gpio_set_level(ROW7, 0);
+
+    gpio_config_t cfg_row8 = { 
+        .pin_bit_mask = (1ULL << ROW8), 
+        .mode = GPIO_MODE_OUTPUT, 
+        .pull_up_en = GPIO_PULLUP_DISABLE, 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_row8); 
+    gpio_set_level(ROW8, 0);
+
+    // ================================================================
+    // CONFIGURAR COLUMNAS ROJAS como salidas → inicio en HIGH (apagadas)
+    // HIGH = apagado porque es lógica negada (cátodo directo)
+    // ================================================================
+    gpio_config_t cfg_cr1 = { .pin_bit_mask = (1ULL << COL_R1), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr1); gpio_set_level(COL_R1, 1);
+
+    gpio_config_t cfg_cr2 = { .pin_bit_mask = (1ULL << COL_R2), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr2); gpio_set_level(COL_R2, 1);
+
+    gpio_config_t cfg_cr3 = { .pin_bit_mask = (1ULL << COL_R3), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr3); gpio_set_level(COL_R3, 1);
+
+    gpio_config_t cfg_cr4 = { .pin_bit_mask = (1ULL << COL_R4), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr4); gpio_set_level(COL_R4, 1);
+
+    gpio_config_t cfg_cr5 = { .pin_bit_mask = (1ULL << COL_R5), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr5); gpio_set_level(COL_R5, 1);
+
+    gpio_config_t cfg_cr6 = { .pin_bit_mask = (1ULL << COL_R6), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr6); gpio_set_level(COL_R6, 1);
+
+    gpio_config_t cfg_cr7 = { .pin_bit_mask = (1ULL << COL_R7), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr7); gpio_set_level(COL_R7, 1);
+
+    gpio_config_t cfg_cr8 = { .pin_bit_mask = (1ULL << COL_R8), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cr8); gpio_set_level(COL_R8, 1);
+
+    // ================================================================
+    // CONFIGURAR COLUMNAS VERDES como salidas → inicio en HIGH (apagadas)
+    // ================================================================
+    gpio_config_t cfg_cg1 = { .pin_bit_mask = (1ULL << COL_G1), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg1); gpio_set_level(COL_G1, 1);
+
+    gpio_config_t cfg_cg2 = { .pin_bit_mask = (1ULL << COL_G2), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg2); gpio_set_level(COL_G2, 1);
+
+    gpio_config_t cfg_cg3 = { .pin_bit_mask = (1ULL << COL_G3), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg3); gpio_set_level(COL_G3, 1);
+
+    gpio_config_t cfg_cg4 = { .pin_bit_mask = (1ULL << COL_G4), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg4); gpio_set_level(COL_G4, 1);
+
+    gpio_config_t cfg_cg5 = { .pin_bit_mask = (1ULL << COL_G5), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg5); gpio_set_level(COL_G5, 1);
+
+    gpio_config_t cfg_cg6 = { .pin_bit_mask = (1ULL << COL_G6), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg6); gpio_set_level(COL_G6, 1);
+
+    gpio_config_t cfg_cg7 = { .pin_bit_mask = (1ULL << COL_G7), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg7); gpio_set_level(COL_G7, 1);
+
+    gpio_config_t cfg_cg8 = { .pin_bit_mask = (1ULL << COL_G8), .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE };
+    gpio_config(&cfg_cg8); gpio_set_level(COL_G8, 1);
+
+    // ================================================================
+    // CONFIGURAR BOTÓN con pull-up interno
+    // ================================================================
+    gpio_config_t cfg_btn = {
+        .pin_bit_mask = (1ULL << BTN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,     // ✅ pull-up interno
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE         // Flanco de bajada = presionado
+    };
+    gpio_config(&cfg_btn);
+
+    // ================================================================
+    // CONFIGURAR TIMER 0 → TICK DEL JUEGO cada 400ms
+    // Controla la velocidad de caída del punto
+    // ================================================================
+    timer_config_t timer_cfg_juego = {
+        .divider = 80,
+        .counter_dir = TIMER_COUNT_UP,
+        .counter_en = TIMER_PAUSE,
+        .alarm_en = TIMER_ALARM_EN,
+        .auto_reload = true  // Se reinicia solo cada 400ms ✅
+    };
+    timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg_juego);
+    timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, TICK_CAIDA);
+    timer_isr_callback_add(TIMER_GROUP_0, TIMER_0, timer_isr_juego, NULL, 0);
+    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
+    timer_start(TIMER_GROUP_0, TIMER_0);
+
+    // ================================================================
+    // CONFIGURAR TIMER 1 → ANTIREBOTE + ALEATORIEDAD
+    // Nunca se reinicia → antirebote correcto
+    // Su valor en microsegundos es impredecible → genera columna aleatoria
+    // ================================================================
+    timer_config_t timer_cfg_antirebote = {
+        .divider = 80,
+        .counter_dir = TIMER_COUNT_UP,
+        .counter_en = TIMER_PAUSE,
+        .alarm_en = TIMER_ALARM_DIS,
+        .auto_reload = false  // NUNCA se reinicia ✅
+    };
+    timer_init(TIMER_GROUP_0, TIMER_1, &timer_cfg_antirebote);
+    timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
+    timer_start(TIMER_GROUP_0, TIMER_1);
+
+    // ================================================================
+    // CONFIGURAR TIMER_GROUP_1/TIMER_0 → MULTIPLEXACIÓN cada 2ms
+    //   GROUP_0 TIMER_0 → tick juego (400ms)
+    //   GROUP_0 TIMER_1 → antirebote + aleatoriedad
+    //   GROUP_1 TIMER_0 → multiplexación (2ms) ✅
+    // ================================================================
+    timer_config_t timer_cfg_multiplex = {
+        .divider = 80,
+        .counter_dir = TIMER_COUNT_UP,
+        .counter_en = TIMER_PAUSE,
+        .alarm_en = TIMER_ALARM_EN,
+        .auto_reload = true  // Se reinicia solo cada 2ms ✅
+    };
+    timer_init(TIMER_GROUP_1, TIMER_0, &timer_cfg_multiplex);
+    timer_set_alarm_value(TIMER_GROUP_1, TIMER_0, DOS_MS);
+    timer_isr_callback_add(TIMER_GROUP_1, TIMER_0, timer_isr_multiplex, NULL, 0);
+    timer_enable_intr(TIMER_GROUP_1, TIMER_0);
+    timer_start(TIMER_GROUP_1, TIMER_0);
+
+    // ================================================================
+    // INSTALAR INTERRUPCIÓN DEL BOTÓN
+    // ================================================================
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BTN, isr_boton, NULL);
+
+    // ================================================================
+    // VARIABLES DEL JUEGO
+    // ================================================================
+    int punto_fila   = 0;  // Fila actual del punto verde (0=arriba, 7=abajo)
+                            // Empieza en la fila 0 (arriba) y baja cada tick
+    int punto_col    = 0;  // Columna del punto verde (0 a 7)
+                            // Se genera aleatoriamente cuando empieza cada caída
+    int canasta_col  = 3;  // Columna de la canasta roja (0 a 7)
+                            // Empieza en el centro (columna 3)
+                            // El botón la mueve 1 columna a la derecha
+
+    int estado = ESTADO_JUGANDO; // Estado actual del juego
+
+    int  ticks_animacion  = 0;    // Cuenta ticks de la animación de éxito/fallo
+    bool estado_parpadeo  = false; // Estado del parpadeo en la animación
+                                   // false = pantalla apagada
+                                   // true  = pantalla encendida (rojo o verde)
+
+    uint64_t valor_timer = 0; // Para leer TIMER_1 y generar columna aleatoria
+
+    // Generar columna inicial del punto
+    timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &valor_timer);
+    punto_col = (int)(valor_timer % 8);
+    // % 8 → resultado 0,1,2,3,4,5,6,7 → columna válida ✅
+
+    // ================================================================
+    // LOOP PRINCIPAL
+    // ================================================================
+    while (1) {
+
+        esp_task_wdt_reset();
+
+        // ============================================================
+        // MULTIPLEXACIÓN DE LA MATRIZ (cada 2ms)
+        // ============================================================
+        // Lógica negada para cátodos directos:
+        //   LED encendido → cátodo en LOW  (GPIO=0)
+        //   LED apagado   → cátodo en HIGH (GPIO=1)
+        // ============================================================
+        if (bandera_multiplex) {
+            bandera_multiplex = false;
+
+            // Paso 1: Apagar todas las filas
+            gpio_set_level(ROW1, 0); gpio_set_level(ROW2, 0);
+            gpio_set_level(ROW3, 0); gpio_set_level(ROW4, 0);
+            gpio_set_level(ROW5, 0); gpio_set_level(ROW6, 0);
+            gpio_set_level(ROW7, 0); gpio_set_level(ROW8, 0);
+
+            // Paso 2: Poner TODAS las columnas en HIGH (apagadas)
+            gpio_set_level(COL_R1, 1); gpio_set_level(COL_R2, 1);
+            gpio_set_level(COL_R3, 1); gpio_set_level(COL_R4, 1);
+            gpio_set_level(COL_R5, 1); gpio_set_level(COL_R6, 1);
+            gpio_set_level(COL_R7, 1); gpio_set_level(COL_R8, 1);
+            gpio_set_level(COL_G1, 1); gpio_set_level(COL_G2, 1);
+            gpio_set_level(COL_G3, 1); gpio_set_level(COL_G4, 1);
+            gpio_set_level(COL_G5, 1); gpio_set_level(COL_G6, 1);
+            gpio_set_level(COL_G7, 1); gpio_set_level(COL_G8, 1);
+
+            // Paso 3: Activar columnas según screen[fila_actual]
+            // ROJO  → cátodo rojo  de esa columna en LOW (GPIO=0)
+            // VERDE → cátodo verde de esa columna en LOW (GPIO=0)
+
+            if (screen[fila_actual][0] == ROJO)  { gpio_set_level(COL_R1, 0); }
+            if (screen[fila_actual][0] == VERDE)  { gpio_set_level(COL_G1, 0); }
+
+            if (screen[fila_actual][1] == ROJO)  { gpio_set_level(COL_R2, 0); }
+            if (screen[fila_actual][1] == VERDE)  { gpio_set_level(COL_G2, 0); }
+
+            if (screen[fila_actual][2] == ROJO)  { gpio_set_level(COL_R3, 0); }
+            if (screen[fila_actual][2] == VERDE)  { gpio_set_level(COL_G3, 0); }
+
+            if (screen[fila_actual][3] == ROJO)  { gpio_set_level(COL_R4, 0); }
+            if (screen[fila_actual][3] == VERDE)  { gpio_set_level(COL_G4, 0); }
+
+            if (screen[fila_actual][4] == ROJO)  { gpio_set_level(COL_R5, 0); }
+            if (screen[fila_actual][4] == VERDE)  { gpio_set_level(COL_G5, 0); }
+
+            if (screen[fila_actual][5] == ROJO)  { gpio_set_level(COL_R6, 0); }
+            if (screen[fila_actual][5] == VERDE)  { gpio_set_level(COL_G6, 0); }
+
+            if (screen[fila_actual][6] == ROJO)  { gpio_set_level(COL_R7, 0); }
+            if (screen[fila_actual][6] == VERDE)  { gpio_set_level(COL_G7, 0); }
+
+            if (screen[fila_actual][7] == ROJO)  { gpio_set_level(COL_R8, 0); }
+            if (screen[fila_actual][7] == VERDE)  { gpio_set_level(COL_G8, 0); }
+
+            // Paso 4: Activar la fila actual
+            if (fila_actual == 0) { gpio_set_level(ROW1, 1); }
+            if (fila_actual == 1) { gpio_set_level(ROW2, 1); }
+            if (fila_actual == 2) { gpio_set_level(ROW3, 1); }
+            if (fila_actual == 3) { gpio_set_level(ROW4, 1); }
+            if (fila_actual == 4) { gpio_set_level(ROW5, 1); }
+            if (fila_actual == 5) { gpio_set_level(ROW6, 1); }
+            if (fila_actual == 6) { gpio_set_level(ROW7, 1); }
+            if (fila_actual == 7) { gpio_set_level(ROW8, 1); }
+
+            // Paso 5: Avanzar a la siguiente fila
+            fila_actual = (fila_actual + 1) % 8;
+            // 0→1→2→3→4→5→6→7→0→1→... ciclo infinito ✅
+        }
+
+        // ============================================================
+        // LÓGICA DEL JUEGO (cada 400ms)
+        // ============================================================
+        if (bandera_tick) {
+            bandera_tick = false;
+
+            if (estado == ESTADO_JUGANDO) {
+
+                // -------------------------------------------------------
+                // MOVER CANASTA con el botón
+                // Si se presionó el botón → mover 1 columna a la derecha
+                // Si llega al borde derecho → vuelve al inicio (columna 0)
+                // -------------------------------------------------------
+                if (bandera_boton) {
+                    bandera_boton = false;
+                    canasta_col++;
+                    if (canasta_col > 7) {
+                        canasta_col = 0;
+                        // Vuelve al inicio cuando pasa de la columna 7
+                    }
+                }
+
+                // -------------------------------------------------------
+                // BAJAR EL PUNTO VERDE
+                // El punto baja 1 fila por tick (cada 400ms)
+                // -------------------------------------------------------
+                punto_fila++;
+                // punto_fila va de 0 a 7
+                // Cuando llega a 7 (fila de abajo) → verificar si fue atrapado
+
+                if (punto_fila > 7) {
+                    // El punto llegó abajo → ¿la canasta está en la misma columna?
+                    if (canasta_col == punto_col) {
+                        // ¡Éxito! La canasta atrapó el punto
+                        estado = ESTADO_EXITO;
+                        ticks_animacion = 0;
+                        estado_parpadeo = false;
+                    } else {
+                        // Fallo → el punto no fue atrapado
+                        estado = ESTADO_FALLO;
+                        ticks_animacion = 0;
+                        estado_parpadeo = false;
+                    }
+                }
+
+                // -------------------------------------------------------
+                // DIBUJAR EL FRAME EN EL BUFFER
+                // -------------------------------------------------------
+
+                // Limpiar todo el buffer
+                screen[0][0]=APAGADO; screen[0][1]=APAGADO; screen[0][2]=APAGADO; screen[0][3]=APAGADO; screen[0][4]=APAGADO; screen[0][5]=APAGADO; screen[0][6]=APAGADO; screen[0][7]=APAGADO;
+                screen[1][0]=APAGADO; screen[1][1]=APAGADO; screen[1][2]=APAGADO; screen[1][3]=APAGADO; screen[1][4]=APAGADO; screen[1][5]=APAGADO; screen[1][6]=APAGADO; screen[1][7]=APAGADO;
+                screen[2][0]=APAGADO; screen[2][1]=APAGADO; screen[2][2]=APAGADO; screen[2][3]=APAGADO; screen[2][4]=APAGADO; screen[2][5]=APAGADO; screen[2][6]=APAGADO; screen[2][7]=APAGADO;
+                screen[3][0]=APAGADO; screen[3][1]=APAGADO; screen[3][2]=APAGADO; screen[3][3]=APAGADO; screen[3][4]=APAGADO; screen[3][5]=APAGADO; screen[3][6]=APAGADO; screen[3][7]=APAGADO;
+                screen[4][0]=APAGADO; screen[4][1]=APAGADO; screen[4][2]=APAGADO; screen[4][3]=APAGADO; screen[4][4]=APAGADO; screen[4][5]=APAGADO; screen[4][6]=APAGADO; screen[4][7]=APAGADO;
+                screen[5][0]=APAGADO; screen[5][1]=APAGADO; screen[5][2]=APAGADO; screen[5][3]=APAGADO; screen[5][4]=APAGADO; screen[5][5]=APAGADO; screen[5][6]=APAGADO; screen[5][7]=APAGADO;
+                screen[6][0]=APAGADO; screen[6][1]=APAGADO; screen[6][2]=APAGADO; screen[6][3]=APAGADO; screen[6][4]=APAGADO; screen[6][5]=APAGADO; screen[6][6]=APAGADO; screen[6][7]=APAGADO;
+                screen[7][0]=APAGADO; screen[7][1]=APAGADO; screen[7][2]=APAGADO; screen[7][3]=APAGADO; screen[7][4]=APAGADO; screen[7][5]=APAGADO; screen[7][6]=APAGADO; screen[7][7]=APAGADO;
+
+                // Dibujar el punto VERDE en su fila y columna actuales
+                // Solo si todavía está dentro de la pantalla (fila 0 a 7)
+                if (punto_fila >= 0 && punto_fila <= 7) {
+                    if (punto_col == 0) { screen[punto_fila][0] = VERDE; }
+                    if (punto_col == 1) { screen[punto_fila][1] = VERDE; }
+                    if (punto_col == 2) { screen[punto_fila][2] = VERDE; }
+                    if (punto_col == 3) { screen[punto_fila][3] = VERDE; }
+                    if (punto_col == 4) { screen[punto_fila][4] = VERDE; }
+                    if (punto_col == 5) { screen[punto_fila][5] = VERDE; }
+                    if (punto_col == 6) { screen[punto_fila][6] = VERDE; }
+                    if (punto_col == 7) { screen[punto_fila][7] = VERDE; }
+                }
+
+                // Dibujar la canasta ROJA en la fila 7 (fila de abajo)
+                // La canasta tiene 3 LEDs de ancho centrados en canasta_col
+                // LED izquierdo → canasta_col - 1 (si existe)
+                // LED central   → canasta_col
+                // LED derecho   → canasta_col + 1 (si existe)
+                if (canasta_col == 0) {
+                    screen[7][0] = ROJO;
+                    screen[7][1] = ROJO;
+                    // No hay columna -1 → canasta recortada a la izquierda
+                }
+                if (canasta_col == 1) {
+                    screen[7][0] = ROJO;
+                    screen[7][1] = ROJO;
+                    screen[7][2] = ROJO;
+                }
+                if (canasta_col == 2) {
+                    screen[7][1] = ROJO;
+                    screen[7][2] = ROJO;
+                    screen[7][3] = ROJO;
+                }
+                if (canasta_col == 3) {
+                    screen[7][2] = ROJO;
+                    screen[7][3] = ROJO;
+                    screen[7][4] = ROJO;
+                }
+                if (canasta_col == 4) {
+                    screen[7][3] = ROJO;
+                    screen[7][4] = ROJO;
+                    screen[7][5] = ROJO;
+                }
+                if (canasta_col == 5) {
+                    screen[7][4] = ROJO;
+                    screen[7][5] = ROJO;
+                    screen[7][6] = ROJO;
+                }
+                if (canasta_col == 6) {
+                    screen[7][5] = ROJO;
+                    screen[7][6] = ROJO;
+                    screen[7][7] = ROJO;
+                }
+                if (canasta_col == 7) {
+                    screen[7][6] = ROJO;
+                    screen[7][7] = ROJO;
+                    // No hay columna 8 → canasta recortada a la derecha
+                }
+
+            } else if (estado == ESTADO_EXITO || estado == ESTADO_FALLO) {
+
+                // -------------------------------------------------------
+                // ANIMACIÓN DE ÉXITO → parpadeo verde
+                // ANIMACIÓN DE FALLO → parpadeo rojo
+                // 6 ticks x 400ms = 2.4 segundos de animación
+                // -------------------------------------------------------
+                ticks_animacion++;
+                estado_parpadeo = !estado_parpadeo;
+                // Alterna entre pantalla llena y pantalla apagada
+
+                if (estado_parpadeo) {
+                    // Llenar pantalla con el color del resultado
+                    uint8_t color = (estado == ESTADO_EXITO) ? VERDE : ROJO;
+                    // Si fue éxito → VERDE, si fue fallo → ROJO
+                    // El operador ? : elige entre dos valores:
+                    // condición ? valor_si_true : valor_si_false
+
+                    screen[0][0]=color; screen[0][1]=color; screen[0][2]=color; screen[0][3]=color; screen[0][4]=color; screen[0][5]=color; screen[0][6]=color; screen[0][7]=color;
+                    screen[1][0]=color; screen[1][1]=color; screen[1][2]=color; screen[1][3]=color; screen[1][4]=color; screen[1][5]=color; screen[1][6]=color; screen[1][7]=color;
+                    screen[2][0]=color; screen[2][1]=color; screen[2][2]=color; screen[2][3]=color; screen[2][4]=color; screen[2][5]=color; screen[2][6]=color; screen[2][7]=color;
+                    screen[3][0]=color; screen[3][1]=color; screen[3][2]=color; screen[3][3]=color; screen[3][4]=color; screen[3][5]=color; screen[3][6]=color; screen[3][7]=color;
+                    screen[4][0]=color; screen[4][1]=color; screen[4][2]=color; screen[4][3]=color; screen[4][4]=color; screen[4][5]=color; screen[4][6]=color; screen[4][7]=color;
+                    screen[5][0]=color; screen[5][1]=color; screen[5][2]=color; screen[5][3]=color; screen[5][4]=color; screen[5][5]=color; screen[5][6]=color; screen[5][7]=color;
+                    screen[6][0]=color; screen[6][1]=color; screen[6][2]=color; screen[6][3]=color; screen[6][4]=color; screen[6][5]=color; screen[6][6]=color; screen[6][7]=color;
+                    screen[7][0]=color; screen[7][1]=color; screen[7][2]=color; screen[7][3]=color; screen[7][4]=color; screen[7][5]=color; screen[7][6]=color; screen[7][7]=color;
+                } else {
+                    // Apagar toda la pantalla
+                    screen[0][0]=APAGADO; screen[0][1]=APAGADO; screen[0][2]=APAGADO; screen[0][3]=APAGADO; screen[0][4]=APAGADO; screen[0][5]=APAGADO; screen[0][6]=APAGADO; screen[0][7]=APAGADO;
+                    screen[1][0]=APAGADO; screen[1][1]=APAGADO; screen[1][2]=APAGADO; screen[1][3]=APAGADO; screen[1][4]=APAGADO; screen[1][5]=APAGADO; screen[1][6]=APAGADO; screen[1][7]=APAGADO;
+                    screen[2][0]=APAGADO; screen[2][1]=APAGADO; screen[2][2]=APAGADO; screen[2][3]=APAGADO; screen[2][4]=APAGADO; screen[2][5]=APAGADO; screen[2][6]=APAGADO; screen[2][7]=APAGADO;
+                    screen[3][0]=APAGADO; screen[3][1]=APAGADO; screen[3][2]=APAGADO; screen[3][3]=APAGADO; screen[3][4]=APAGADO; screen[3][5]=APAGADO; screen[3][6]=APAGADO; screen[3][7]=APAGADO;
+                    screen[4][0]=APAGADO; screen[4][1]=APAGADO; screen[4][2]=APAGADO; screen[4][3]=APAGADO; screen[4][4]=APAGADO; screen[4][5]=APAGADO; screen[4][6]=APAGADO; screen[4][7]=APAGADO;
+                    screen[5][0]=APAGADO; screen[5][1]=APAGADO; screen[5][2]=APAGADO; screen[5][3]=APAGADO; screen[5][4]=APAGADO; screen[5][5]=APAGADO; screen[5][6]=APAGADO; screen[5][7]=APAGADO;
+                    screen[6][0]=APAGADO; screen[6][1]=APAGADO; screen[6][2]=APAGADO; screen[6][3]=APAGADO; screen[6][4]=APAGADO; screen[6][5]=APAGADO; screen[6][6]=APAGADO; screen[6][7]=APAGADO;
+                    screen[7][0]=APAGADO; screen[7][1]=APAGADO; screen[7][2]=APAGADO; screen[7][3]=APAGADO; screen[7][4]=APAGADO; screen[7][5]=APAGADO; screen[7][6]=APAGADO; screen[7][7]=APAGADO;
+                }
+
+                if (ticks_animacion >= TICKS_ANIMACION) {
+                    // Animación terminada → lanzar nuevo punto y continuar
+                    estado = ESTADO_JUGANDO;
+                    ticks_animacion = 0;
+                    estado_parpadeo = false;
+                    punto_fila = 0; // El punto empieza desde arriba de nuevo
+
+                    // Generar nueva columna aleatoria para el punto
+                    timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &valor_timer);
+                    punto_col = (int)(valor_timer % 8);
+                    // % 8 → resultado 0 a 7 → columna válida ✅
+
+                    // Limpiar pantalla
+                    screen[0][0]=APAGADO; screen[0][1]=APAGADO; screen[0][2]=APAGADO; screen[0][3]=APAGADO; screen[0][4]=APAGADO; screen[0][5]=APAGADO; screen[0][6]=APAGADO; screen[0][7]=APAGADO;
+                    screen[1][0]=APAGADO; screen[1][1]=APAGADO; screen[1][2]=APAGADO; screen[1][3]=APAGADO; screen[1][4]=APAGADO; screen[1][5]=APAGADO; screen[1][6]=APAGADO; screen[1][7]=APAGADO;
+                    screen[2][0]=APAGADO; screen[2][1]=APAGADO; screen[2][2]=APAGADO; screen[2][3]=APAGADO; screen[2][4]=APAGADO; screen[2][5]=APAGADO; screen[2][6]=APAGADO; screen[2][7]=APAGADO;
+                    screen[3][0]=APAGADO; screen[3][1]=APAGADO; screen[3][2]=APAGADO; screen[3][3]=APAGADO; screen[3][4]=APAGADO; screen[3][5]=APAGADO; screen[3][6]=APAGADO; screen[3][7]=APAGADO;
+                    screen[4][0]=APAGADO; screen[4][1]=APAGADO; screen[4][2]=APAGADO; screen[4][3]=APAGADO; screen[4][4]=APAGADO; screen[4][5]=APAGADO; screen[4][6]=APAGADO; screen[4][7]=APAGADO;
+                    screen[5][0]=APAGADO; screen[5][1]=APAGADO; screen[5][2]=APAGADO; screen[5][3]=APAGADO; screen[5][4]=APAGADO; screen[5][5]=APAGADO; screen[5][6]=APAGADO; screen[5][7]=APAGADO;
+                    screen[6][0]=APAGADO; screen[6][1]=APAGADO; screen[6][2]=APAGADO; screen[6][3]=APAGADO; screen[6][4]=APAGADO; screen[6][5]=APAGADO; screen[6][6]=APAGADO; screen[6][7]=APAGADO;
+                    screen[7][0]=APAGADO; screen[7][1]=APAGADO; screen[7][2]=APAGADO; screen[7][3]=APAGADO; screen[7][4]=APAGADO; screen[7][5]=APAGADO; screen[7][6]=APAGADO; screen[7][7]=APAGADO;
+                }
+            }
+        }
+    }
+}
