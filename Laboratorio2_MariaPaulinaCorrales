@@ -4,12 +4,6 @@
 // El botón mueve la canasta 1 columna a la derecha
 // Si la canasta atrapa el punto → parpadeo verde (éxito)
 // Si no lo atrapa → parpadeo rojo (fallo)
-//
-// Matriz de ÁNODO COMÚN por filas, CÁTODO COMÚN por columnas
-// Sin transistores → cátodo directo al GPIO
-//   Fila activa   → GPIO=1 (ánodo en HIGH)
-//   LED encendido → GPIO=0 (cátodo en LOW,  lógica negada)
-//   LED apagado   → GPIO=1 (cátodo en HIGH, lógica negada)
 
 #include <stdio.h>
 #include <inttypes.h>
@@ -73,14 +67,12 @@
 // TIEMPOS
 // ================================================================
 #define DOS_MS      2000ULL   // 2ms por fila → ciclo 16ms = 62Hz
-                               // Suficiente para no ver parpadeo ✅
                                // Más tiempo que 1ms → el while alcanza
                                // a procesar cada fila correctamente
 
 #define TICK_CAIDA  400000ULL // 400ms → velocidad de caída del punto
                                // El punto baja 1 fila cada 400ms
                                // 8 filas x 400ms = 3.2 segundos por caída
-                               // Tiempo suficiente para reaccionar ✅
 
 #define TICK_CANASTA 300000ULL // 300ms → velocidad de respuesta del botón
                                 // Cada 300ms se acepta una nueva pulsación
@@ -311,7 +303,7 @@ void app_main(void) {
     gpio_config_t cfg_btn = {
         .pin_bit_mask = (1ULL << BTN),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,     // ✅ pull-up interno
+        .pull_up_en = GPIO_PULLUP_ENABLE,     
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_NEGEDGE         // Flanco de bajada = presionado
     };
@@ -326,7 +318,7 @@ void app_main(void) {
         .counter_dir = TIMER_COUNT_UP,
         .counter_en = TIMER_PAUSE,
         .alarm_en = TIMER_ALARM_EN,
-        .auto_reload = true  // Se reinicia solo cada 400ms ✅
+        .auto_reload = true  // Se reinicia solo cada 400ms 
     };
     timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg_juego);
     timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, TICK_CAIDA);
@@ -344,7 +336,7 @@ void app_main(void) {
         .counter_dir = TIMER_COUNT_UP,
         .counter_en = TIMER_PAUSE,
         .alarm_en = TIMER_ALARM_DIS,
-        .auto_reload = false  // NUNCA se reinicia ✅
+        .auto_reload = false  // NUNCA se reinicia 
     };
     timer_init(TIMER_GROUP_0, TIMER_1, &timer_cfg_antirebote);
     timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
@@ -398,11 +390,7 @@ void app_main(void) {
     // Generar columna inicial del punto
     timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &valor_timer);
     punto_col = (int)(valor_timer % 8);
-    // % 8 → resultado 0,1,2,3,4,5,6,7 → columna válida ✅
 
-    // ================================================================
-    // LOOP PRINCIPAL
-    // ================================================================
     while (1) {
 
         esp_task_wdt_reset();
@@ -473,7 +461,6 @@ void app_main(void) {
 
             // Paso 5: Avanzar a la siguiente fila
             fila_actual = (fila_actual + 1) % 8;
-            // 0→1→2→3→4→5→6→7→0→1→... ciclo infinito ✅
         }
 
         // ============================================================
@@ -550,9 +537,9 @@ void app_main(void) {
 
                 // Dibujar la canasta ROJA en la fila 7 (fila de abajo)
                 // La canasta tiene 3 LEDs de ancho centrados en canasta_col
-                // LED izquierdo → canasta_col - 1 (si existe)
+                // LED izquierdo → canasta_col - 1 
                 // LED central   → canasta_col
-                // LED derecho   → canasta_col + 1 (si existe)
+                // LED derecho   → canasta_col + 1 
                 if (canasta_col == 0) {
                     screen[7][0] = ROJO;
                     screen[7][1] = ROJO;
@@ -642,7 +629,6 @@ void app_main(void) {
                     // Generar nueva columna aleatoria para el punto
                     timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &valor_timer);
                     punto_col = (int)(valor_timer % 8);
-                    // % 8 → resultado 0 a 7 → columna válida ✅
 
                     // Limpiar pantalla
                     screen[0][0]=APAGADO; screen[0][1]=APAGADO; screen[0][2]=APAGADO; screen[0][3]=APAGADO; screen[0][4]=APAGADO; screen[0][5]=APAGADO; screen[0][6]=APAGADO; screen[0][7]=APAGADO;
