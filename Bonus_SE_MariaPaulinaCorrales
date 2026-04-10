@@ -1,0 +1,548 @@
+#include <stdio.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/timer.h"
+#include "driver/ledc.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_task_wdt.h"
+
+// ================================================================
+// PINES
+// ================================================================
+#define POT_ADC_CHANNEL ADC_CHANNEL_6  // GPIO34
+
+#define S1 14   // Botón giro derecha
+#define S2 13   // Botón giro izquierda
+
+// MOSFETs via 4N25
+// Q1 = IRF9630 P, lado alto izquierda
+// Q2 = IRFZ44N N, lado bajo izquierda  → PWM sentido 2
+// Q3 = IRF9630 P, lado alto derecha
+// Q4 = IRFZ44N N, lado bajo derecha    → PWM sentido 1
+#define PIN_M1 27  // Q1
+#define PIN_M2 26  // PWM canal 1 → sentido 2 / Q2
+#define PIN_M3 25  // Q3
+#define PIN_M4 33  // PWM canal 0 → sentido 1 / Q4
+
+#define LED_VERDE 32
+#define LED_ROJO   2
+
+// Segmentos
+#define SEG_A 19
+#define SEG_B 18
+#define SEG_C 5
+#define SEG_D 17
+#define SEG_E 16
+#define SEG_F 4
+#define SEG_G 15
+
+// COMs via transistor 2N2222
+#define COM_CENTENAS 21
+#define COM_DECENAS  22
+#define COM_UNIDADES 23
+
+// PWM: Q4 en canal 0, Q2 en canal 1
+#define LEDC_CANAL_Q4   LEDC_CHANNEL_0
+#define LEDC_CANAL_Q2   LEDC_CHANNEL_1
+#define LEDC_TIMER_PWM  LEDC_TIMER_0
+#define LEDC_MODO       LEDC_LOW_SPEED_MODE
+#define LEDC_FRECUENCIA 5000
+#define LEDC_RESOLUCION LEDC_TIMER_10_BIT
+
+// Tiempos
+#define OCHO_MS      8000ULL
+#define TICK_100MS  100000ULL
+#define DEBOUNCE_US 200000ULL
+#define TIEMPO_FRENO 500000ULL
+
+// Estados del motor
+#define MOTOR_SENTIDO1 0  // Q1 + Q4
+#define MOTOR_SENTIDO2 1  // Q2 + Q3
+
+// Variables volátiles
+static volatile bool bandera_s1        = false;
+static volatile bool bandera_s2        = false;
+static volatile bool bandera_tick      = false;
+static volatile bool bandera_multiplex = false;
+static volatile uint64_t ultimo_s1     = 0;
+static volatile uint64_t ultimo_s2     = 0;
+static volatile int display_actual     = 0;
+
+// ISRs
+static void IRAM_ATTR isr_s1(void *arg) {
+    uint64_t ahora = 0;
+    timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &ahora);
+    if (ahora - ultimo_s1 >= DEBOUNCE_US) { 
+        bandera_s1 = true; 
+        ultimo_s1 = ahora; 
+    }
+}
+static void IRAM_ATTR isr_s2(void *arg) {
+    uint64_t ahora = 0;
+    timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &ahora);
+    if (ahora - ultimo_s2 >= DEBOUNCE_US) { 
+        bandera_s2 = true; 
+        ultimo_s2 = ahora; 
+    }
+}
+static bool IRAM_ATTR timer_isr_tick(void *arg)      { 
+    bandera_tick = true;      
+    return true; 
+}
+static bool IRAM_ATTR timer_isr_multiplex(void *arg) { 
+    bandera_multiplex = true; 
+    return true; 
+}
+
+// ================================================================
+// FUNCIÓN MOSTRAR DÍGITO
+// ================================================================
+void mostrar_digito(int numero) {
+    if (numero == 0) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,0); gpio_set_level(SEG_F,0); gpio_set_level(SEG_G,1); }
+    if (numero == 1) { gpio_set_level(SEG_A,1); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,1); gpio_set_level(SEG_E,1); gpio_set_level(SEG_F,1); gpio_set_level(SEG_G,1); }
+    if (numero == 2) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,1); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,0); gpio_set_level(SEG_F,1); gpio_set_level(SEG_G,0); }
+    if (numero == 3) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,1); gpio_set_level(SEG_F,1); gpio_set_level(SEG_G,0); }
+    if (numero == 4) { gpio_set_level(SEG_A,1); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,1); gpio_set_level(SEG_E,1); gpio_set_level(SEG_F,0); gpio_set_level(SEG_G,0); }
+    if (numero == 5) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,1); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,1); gpio_set_level(SEG_F,0); gpio_set_level(SEG_G,0); }
+    if (numero == 6) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,1); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,0); gpio_set_level(SEG_F,0); gpio_set_level(SEG_G,0); }
+    if (numero == 7) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,1); gpio_set_level(SEG_E,1); gpio_set_level(SEG_F,1); gpio_set_level(SEG_G,1); }
+    if (numero == 8) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,0); gpio_set_level(SEG_F,0); gpio_set_level(SEG_G,0); }
+    if (numero == 9) { gpio_set_level(SEG_A,0); gpio_set_level(SEG_B,0); gpio_set_level(SEG_C,0); gpio_set_level(SEG_D,0); gpio_set_level(SEG_E,1); gpio_set_level(SEG_F,0); gpio_set_level(SEG_G,0); }
+}
+
+// ================================================================
+// ESTADO SEGURO: todos los MOSFETs apagados
+// Q1(P)=0 → apagado, Q3(P)=0 → apagado
+// Q2(N) duty=1023 → apagado, Q4(N) duty=1023 → apagado
+// ================================================================
+void apagar_motor() {
+    gpio_set_level(PIN_M1, 0); // Q1 P apagado
+    gpio_set_level(PIN_M3, 0); // Q3 P apagado
+    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q4, 1023); // Q4 N apagado
+    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q4);
+    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q2, 1023); // Q2 N apagado
+    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q2);
+}
+
+void app_main(void) {
+
+    // WDT
+    const esp_task_wdt_config_t wdt_cfg = { 
+        .timeout_ms=5000, .idle_core_mask=0, 
+        .trigger_panic=true 
+    };
+    esp_task_wdt_init(&wdt_cfg);
+    esp_task_wdt_add(NULL);
+
+    // ================================================================
+    // SEGMENTOS
+    // ================================================================
+    gpio_config_t cfg_seg_a = { 
+        .pin_bit_mask=(1ULL<<SEG_A), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_a); 
+    gpio_set_level(SEG_A, 1);
+    gpio_config_t cfg_seg_b = { 
+        .pin_bit_mask=(1ULL<<SEG_B), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_b);
+    gpio_set_level(SEG_B, 1);
+    gpio_config_t cfg_seg_c = { 
+        .pin_bit_mask=(1ULL<<SEG_C), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_c); 
+    gpio_set_level(SEG_C, 1);
+    gpio_config_t cfg_seg_d = { 
+        .pin_bit_mask=(1ULL<<SEG_D), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_d); 
+    gpio_set_level(SEG_D, 1);
+    gpio_config_t cfg_seg_e = { 
+        .pin_bit_mask=(1ULL<<SEG_E), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_e); 
+    gpio_set_level(SEG_E, 1);
+    gpio_config_t cfg_seg_f = { 
+        .pin_bit_mask=(1ULL<<SEG_F), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_f); 
+    gpio_set_level(SEG_F, 1);
+    gpio_config_t cfg_seg_g = { 
+        .pin_bit_mask=(1ULL<<SEG_G), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_seg_g);
+     gpio_set_level(SEG_G, 1);
+
+    // ================================================================
+    // COMs - transistor 2N2222
+    // ================================================================
+    gpio_config_t cfg_com_c = { 
+        .pin_bit_mask=(1ULL<<COM_CENTENAS), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_com_c); 
+    gpio_set_level(COM_CENTENAS, 1); // Apagado al inicio
+    gpio_config_t cfg_com_d = { 
+        .pin_bit_mask=(1ULL<<COM_DECENAS), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_com_d); 
+    gpio_set_level(COM_DECENAS, 1);
+    gpio_config_t cfg_com_u = { 
+        .pin_bit_mask=(1ULL<<COM_UNIDADES), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_com_u); 
+    gpio_set_level(COM_UNIDADES, 1);
+
+    // ================================================================
+    // LEDs
+    // ================================================================
+    gpio_config_t cfg_led_v = { 
+        .pin_bit_mask=(1ULL<<LED_VERDE), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_led_v); 
+    gpio_set_level(LED_VERDE, 0);
+    gpio_config_t cfg_led_r = { 
+        .pin_bit_mask=(1ULL<<LED_ROJO), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_led_r); 
+    gpio_set_level(LED_ROJO, 0);
+
+    // Pines Q1 y Q3 (IRF9630 P, salidas digitales)
+    gpio_config_t cfg_m1 = { 
+        .pin_bit_mask=(1ULL<<PIN_M1), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_m1); 
+    gpio_set_level(PIN_M1, 0); // Q1 apagado al inicio
+    gpio_config_t cfg_m3 = { 
+        .pin_bit_mask=(1ULL<<PIN_M3), 
+        .mode=GPIO_MODE_OUTPUT, 
+        .pull_up_en=GPIO_PULLUP_DISABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_DISABLE 
+    };
+    gpio_config(&cfg_m3); 
+    gpio_set_level(PIN_M3, 0); // Q3 apagado al inicio
+
+    // ================================================================
+    // BOTONES
+    // ================================================================
+    gpio_config_t cfg_s1 = { 
+        .pin_bit_mask=(1ULL<<S1), 
+        .mode=GPIO_MODE_INPUT, 
+        .pull_up_en=GPIO_PULLUP_ENABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_NEGEDGE 
+    };
+    gpio_config(&cfg_s1);
+    gpio_config_t cfg_s2 = { 
+        .pin_bit_mask=(1ULL<<S2), 
+        .mode=GPIO_MODE_INPUT, 
+        .pull_up_en=GPIO_PULLUP_ENABLE, 
+        .pull_down_en=GPIO_PULLDOWN_DISABLE, 
+        .intr_type=GPIO_INTR_NEGEDGE 
+    };
+    gpio_config(&cfg_s2);
+
+    // PWM para Q4 (canal 0) y Q2 (canal 1)
+    // duty=1023 al inicio → Q4 y Q2 apagados
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode=LEDC_MODO, 
+        .timer_num=LEDC_TIMER_PWM,
+        .duty_resolution=LEDC_RESOLUCION, 
+        .freq_hz=LEDC_FRECUENCIA, 
+        .clk_cfg=LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    ledc_channel_config_t ledc_q4 = {
+        .speed_mode=LEDC_MODO, 
+        .channel=LEDC_CANAL_Q4, 
+        .timer_sel=LEDC_TIMER_PWM,
+        .intr_type=LEDC_INTR_DISABLE, 
+        .gpio_num=PIN_M4, 
+        .duty=1023, 
+        .hpoint=0
+    };
+    ledc_channel_config(&ledc_q4);
+
+    ledc_channel_config_t ledc_q2 = {
+        .speed_mode=LEDC_MODO, 
+        .channel=LEDC_CANAL_Q2, 
+        .timer_sel=LEDC_TIMER_PWM,
+        .intr_type=LEDC_INTR_DISABLE, 
+        .gpio_num=PIN_M2, 
+        .duty=1023, 
+        .hpoint=0
+    };
+    ledc_channel_config(&ledc_q2);
+
+
+    // ================================================================
+    // ADC
+    // ================================================================
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_oneshot_unit_init_cfg_t init_config = { 
+        .unit_id = ADC_UNIT_1 
+    };
+    adc_oneshot_new_unit(&init_config, &adc1_handle);
+    adc_oneshot_chan_cfg_t chan_config = { 
+        .bitwidth=ADC_BITWIDTH_DEFAULT, 
+        .atten=ADC_ATTEN_DB_12 
+    };
+    adc_oneshot_config_channel(adc1_handle, POT_ADC_CHANNEL, &chan_config);
+
+    adc_cali_handle_t adc_cali_handle;
+    adc_cali_line_fitting_config_t cali_config = { 
+        .unit_id=ADC_UNIT_1, 
+        .atten=ADC_ATTEN_DB_12, 
+        .bitwidth=ADC_BITWIDTH_DEFAULT 
+    };
+    adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle);
+
+    // ================================================================
+    // TIMERS
+    // ================================================================
+    timer_config_t timer_cfg_tick = { 
+        .divider=80, 
+        .counter_dir=TIMER_COUNT_UP, 
+        .counter_en=TIMER_PAUSE, 
+        .alarm_en=TIMER_ALARM_EN, 
+        .auto_reload=true 
+    };
+    timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg_tick);
+    timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, TICK_100MS);
+    timer_isr_callback_add(TIMER_GROUP_0, TIMER_0, timer_isr_tick, NULL, 0);
+    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
+    timer_start(TIMER_GROUP_0, TIMER_0);
+
+    timer_config_t timer_cfg_antirebote = { 
+        .divider=80, 
+        .counter_dir=TIMER_COUNT_UP, 
+        .counter_en=TIMER_PAUSE, 
+        .alarm_en=TIMER_ALARM_DIS, 
+        .auto_reload=false 
+    };
+    timer_init(TIMER_GROUP_0, TIMER_1, &timer_cfg_antirebote);
+    timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
+    timer_start(TIMER_GROUP_0, TIMER_1);
+
+    timer_config_t timer_cfg_multiplex = { 
+        .divider=80, 
+        .counter_dir=TIMER_COUNT_UP, 
+        .counter_en=TIMER_PAUSE, 
+        .alarm_en=TIMER_ALARM_EN, 
+        .auto_reload=true 
+    };
+    timer_init(TIMER_GROUP_1, TIMER_0, &timer_cfg_multiplex);
+    timer_set_alarm_value(TIMER_GROUP_1, TIMER_0, OCHO_MS);
+    timer_isr_callback_add(TIMER_GROUP_1, TIMER_0, timer_isr_multiplex, NULL, 0);
+    timer_enable_intr(TIMER_GROUP_1, TIMER_0);
+    timer_start(TIMER_GROUP_1, TIMER_0);
+
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(S1, isr_s1, NULL);
+    gpio_isr_handler_add(S2, isr_s2, NULL);
+
+    // ================================================================
+    // VARIABLES
+    // ================================================================
+    int estado_motor   = MOTOR_SENTIDO1;
+    int porcentaje     = 0;
+    int duty_calculado = 0;
+    int duty_invertido = 1023;
+
+    bool frenando      = false;
+    uint64_t tiempo_freno = 0;
+    int nuevo_estado   = MOTOR_SENTIDO1;
+    int adc_raw=0, voltaje_mv=0;
+    int centena=0, decena=0, unidad=0;
+
+    // ================================================================
+    // ESTADO INICIAL: sentido 1, motor parado, LED verde ON
+    // ================================================================
+    gpio_set_level(LED_VERDE, 1);
+    gpio_set_level(LED_ROJO,  0);
+    gpio_set_level(PIN_M1, 1); // Q1 P encendido
+    gpio_set_level(PIN_M3, 0); // Q3 P apagado
+    // Q4 y Q2 con duty=1023 → apagados → motor parado
+
+    while (1) {
+        esp_task_wdt_reset();
+
+        // ============================================================
+        // MULTIPLEXACIÓN DISPLAYS (cada 8ms)
+        // ============================================================
+        if (bandera_multiplex) {
+            bandera_multiplex = false;
+
+            // Apagar todos los displays (GPIO=1 → transistor conduce → COM a GND → apagado)
+            gpio_set_level(COM_CENTENAS, 1);
+            gpio_set_level(COM_DECENAS,  1);
+            gpio_set_level(COM_UNIDADES, 1);
+            // Limpiar segmentos (GPIO=1 → apagado)
+            gpio_set_level(SEG_A,1); 
+            gpio_set_level(SEG_B,1);
+            gpio_set_level(SEG_C,1); 
+            gpio_set_level(SEG_D,1);
+            gpio_set_level(SEG_E,1); 
+            gpio_set_level(SEG_F,1);
+            gpio_set_level(SEG_G,1);
+
+            if (display_actual == 0) {
+                mostrar_digito(centena);
+                gpio_set_level(COM_CENTENAS, 0); 
+                display_actual = 1;
+            } else if (display_actual == 1) {
+                mostrar_digito(decena);
+                gpio_set_level(COM_DECENAS, 0);  
+                display_actual = 2;
+            } else {
+                mostrar_digito(unidad);
+                gpio_set_level(COM_UNIDADES, 0); 
+                display_actual = 0;
+            }
+        }
+
+        // ============================================================
+        // BOTONES
+        // ============================================================
+        if (bandera_s1) {
+            bandera_s1 = false;
+            if (estado_motor != MOTOR_SENTIDO1 && !frenando) {
+                frenando = true;
+                nuevo_estado = MOTOR_SENTIDO1;
+                apagar_motor(); 
+                timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &tiempo_freno);
+            }
+        }
+        if (bandera_s2) {
+            bandera_s2 = false;
+            if (estado_motor != MOTOR_SENTIDO2 && !frenando) {
+                frenando = true;
+                nuevo_estado = MOTOR_SENTIDO2;
+                apagar_motor();
+                timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &tiempo_freno);
+            }
+        }
+
+        // ============================================================
+        // PERÍODO DE FRENO (500ms)
+        // ============================================================
+        if (frenando) {
+            uint64_t ahora = 0;
+            timer_get_counter_value(TIMER_GROUP_0, TIMER_1, &ahora);
+            if (ahora - tiempo_freno >= TIEMPO_FRENO) {
+                frenando = false;
+                estado_motor = nuevo_estado;
+
+                if (estado_motor == MOTOR_SENTIDO1) {
+                    // Q1(P) + Q4(N) → sentido 1
+                    gpio_set_level(PIN_M3, 0);  // Q3 P apagado primero
+                    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q2, 1023); // Q2 N apagado
+                    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q2);
+                    gpio_set_level(PIN_M1, 1);  // Q1 P encendido 
+                    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q4, duty_invertido); // Q4 N PWM 
+                    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q4);
+                    gpio_set_level(LED_VERDE, 1);
+                    gpio_set_level(LED_ROJO,  0);
+                } else {
+                    // Q2(N) + Q3(P) → sentido 2
+                    gpio_set_level(PIN_M1, 0);  // Q1 P apagado primero
+                    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q4, 1023); // Q4 N apagado
+                    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q4);
+                    gpio_set_level(PIN_M3, 1);  // Q3 P encendido 
+                    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q2, duty_invertido); // Q2 N PWM 
+                    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q2);
+                    gpio_set_level(LED_VERDE, 0);
+                    gpio_set_level(LED_ROJO,  1);
+                }
+            }
+        }
+
+        // ============================================================
+        // LECTURA ADC Y ACTUALIZACIÓN VELOCIDAD (cada 100ms)
+        // ============================================================
+        if (bandera_tick) {
+            bandera_tick = false;
+
+            adc_oneshot_read(adc1_handle, POT_ADC_CHANNEL, &adc_raw);
+            adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltaje_mv);
+
+            porcentaje = voltaje_mv * 100 / 3300;
+            if (porcentaje > 100) porcentaje = 100;
+            if (porcentaje < 0)   porcentaje = 0;
+
+            duty_calculado = porcentaje * 1023 / 100;
+            duty_invertido = 1023 - duty_calculado;
+
+            if (!frenando) {
+                if (estado_motor == MOTOR_SENTIDO1) {
+                    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q4, duty_invertido);
+                    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q4);
+                } else {
+                    ledc_set_duty(LEDC_MODO, LEDC_CANAL_Q2, duty_invertido);
+                    ledc_update_duty(LEDC_MODO, LEDC_CANAL_Q2);
+                }
+            }
+
+            centena = porcentaje / 100;
+            decena  = (porcentaje % 100) / 10;
+            unidad  = porcentaje % 10;
+        }
+    }
+} 
