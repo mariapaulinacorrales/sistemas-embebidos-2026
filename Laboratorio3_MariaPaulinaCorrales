@@ -1,0 +1,326 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/uart.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_timer.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+// ---------------- PINES ----------------
+// ADC
+#define LM35_CH     ADC_CHANNEL_6   // GPIO34
+#define LDR_CH      ADC_CHANNEL_7   // GPIO35
+
+// Motor 
+#define IN1         GPIO_NUM_27
+#define IN2         GPIO_NUM_26
+#define IN3         GPIO_NUM_25
+#define IN4         GPIO_NUM_33
+
+// Bombilla 
+#define BOMBILLA    GPIO_NUM_2
+
+// LED potencia
+#define LED_PWR     GPIO_NUM_18
+
+// ------------ PWM LEDs -----------------
+#define PWM_FREQ    200
+#define PWM_MAX     1023
+
+#define LDR_OSCURO  500
+#define LDR_LUZ     2500
+
+#define BUF_SIZE    64
+
+adc_oneshot_unit_handle_t adc1_handle;
+adc_cali_handle_t adc_cali_handle;
+
+float temp_control = 22.0;
+
+int pasos[4][4] = {
+    {1, 0, 1, 0},   // Paso 1: A+ y B+
+    {0, 1, 1, 0},   // Paso 2: A- y B+
+    {0, 1, 0, 1},   // Paso 3: A- y B-
+    {1, 0, 0, 1}    // Paso 4: A+ y B-
+};
+
+int limitar(int x, int min, int max)
+{
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+}
+
+void motor_set(int a, int b, int c, int d)
+{
+    gpio_set_level(IN1, a);
+    gpio_set_level(IN2, b);
+    gpio_set_level(IN3, c);
+    gpio_set_level(IN4, d);
+}
+
+void motor_off(void)
+{
+    motor_set(0, 0, 0, 0);
+}
+
+void pwm_leds_init(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .freq_hz = PWM_FREQ,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer);
+
+    ledc_channel_config_t ch = {
+        .gpio_num = LED_PWR,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ledc_channel_config(&ch);
+}
+
+void set_led_percent(int percent)
+{
+    percent = limitar(percent, 0, 100);
+    int duty = (percent * PWM_MAX) / 100;
+
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+void adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t init = {
+        .unit_id = ADC_UNIT_1
+    };
+    adc_oneshot_new_unit(&init, &adc1_handle);
+
+    adc_oneshot_chan_cfg_t cfg = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_11
+    };
+
+    adc_oneshot_config_channel(adc1_handle, LDR_CH, &cfg);
+    adc_oneshot_config_channel(adc1_handle, LM35_CH, &cfg);
+    
+    // Calibración para el LM35
+    adc_cali_line_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_11,
+        .bitwidth = ADC_BITWIDTH_12
+    };
+    adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle);
+}
+
+float leer_lm35(void)
+{
+    int adc = 0;
+    int mv = 0;
+    adc_oneshot_read(adc1_handle, LM35_CH, &adc);
+    adc_cali_raw_to_voltage(adc_cali_handle, adc, &mv);
+    
+    float temperatura = mv / 10.0f;
+    return temperatura;
+}
+
+int leer_luz_percent(void)
+{
+    int adc = 0;
+    adc_oneshot_read(adc1_handle, LDR_CH, &adc);
+
+    adc = limitar(adc, LDR_OSCURO, LDR_LUZ);
+
+    int porcentaje = ((adc - LDR_OSCURO) * 100) / (LDR_LUZ - LDR_OSCURO);
+    return limitar(porcentaje, 0, 100);
+}
+
+int calcular_led_percent(int luz)
+{
+    if (luz < 20) return 100;
+    else if (luz < 30) return 80;
+    else if (luz < 40) return 60;
+    else if (luz < 60) return 50;
+    else if (luz < 80) return 30;
+    else return 0;
+}
+
+void uart_init(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
+}
+
+static char uart_buffer[BUF_SIZE];
+static int uart_idx = 0;
+
+void revisar_serial(void)
+{
+    uint8_t byte;
+    int len = uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(10));
+    if (len <= 0) return;  
+    
+    if (byte == '\n' || byte == '\r' || uart_idx >= BUF_SIZE - 1)
+    {
+        if (uart_idx > 0)
+        {
+            uart_buffer[uart_idx] = '\0';  
+            
+            printf("DEBUG: Comando recibido: \"%s\"\n", uart_buffer);
+
+            char *ptr = strstr(uart_buffer, "SET_TEMP:");
+            if (ptr != NULL)
+            {
+                float nueva_tc = atof(ptr + 9);
+                if (nueva_tc >= 10.0f && nueva_tc <= 40.0f)
+                {
+                    temp_control = nueva_tc;
+                    printf("Tc actualizada a %.1f C\n", temp_control);
+                }
+                else
+                {
+                    printf("Error: Tc debe estar entre 10 y 40 C\n");
+                }
+            }
+            else if (uart_idx > 0)
+            {
+                printf("Comando no valido: \"%s\"\n", uart_buffer);
+                printf("Usa: SET_TEMP:XX (ej: SET_TEMP:25)\n");
+            }
+        }
+        uart_idx = 0;  
+    }
+    else
+    {
+        uart_buffer[uart_idx++] = (char)byte;
+    }
+}
+
+void app_main(void)
+{
+
+    gpio_set_direction(BOMBILLA, GPIO_MODE_OUTPUT);
+    gpio_set_direction(IN1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(IN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(IN3, GPIO_MODE_OUTPUT);
+    gpio_set_direction(IN4, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(BOMBILLA, 0);
+    motor_off();
+
+    adc_init();
+    pwm_leds_init();
+    uart_init();
+
+    printf("=== SISTEMA DOMOTICO ===\n");
+    printf("Lógica: 1 enciende bombilla, 0 apaga\n");
+    printf("Comando: SET_TEMP:XX (ej: SET_TEMP:25)\n");
+    printf("========================\n");
+
+    int paso = 0;
+    int direccion = 1;      // 1 = horario, -1 = antihorario
+    int steps_s = 0;        // Velocidad actual (pasos/segundo)
+
+    int64_t last_step = esp_timer_get_time();
+    int64_t last_print = esp_timer_get_time();
+
+    while (1)
+    {
+        revisar_serial();
+
+        float temp = leer_lm35();
+        int luz = leer_luz_percent();
+        int led_percent = calcular_led_percent(luz);
+
+        set_led_percent(led_percent);
+
+        if (temp >= temp_control - 1 && temp <= temp_control + 1)
+        {
+            gpio_set_level(BOMBILLA, 0);
+            steps_s = 0;
+            motor_off();
+        }
+        else if (temp < temp_control - 1)
+        {
+            gpio_set_level(BOMBILLA, 1);   
+            direccion = 1;                  
+            steps_s = 200;
+        }
+        else if (temp > temp_control + 1 && temp < temp_control + 3)
+        {
+            gpio_set_level(BOMBILLA, 0);
+            direccion = -1;                 
+            steps_s = 200;
+        }
+        else if (temp >= temp_control + 3 && temp <= temp_control + 5)
+        {
+            gpio_set_level(BOMBILLA, 0);
+            direccion = -1;
+            steps_s = 800;
+        }
+        else if (temp > temp_control + 5)
+        {
+            gpio_set_level(BOMBILLA, 0);
+            direccion = -1;
+            steps_s = 1200;
+        }
+        if (steps_s > 0)
+        {
+            int intervalo_us = 1000000 / steps_s; 
+            int64_t ahora = esp_timer_get_time();
+
+            if (ahora - last_step >= intervalo_us)
+            {
+                last_step = ahora;
+
+                paso += direccion; 
+                if (paso > 3) paso = 0;
+                if (paso < 0) paso = 3;
+
+                motor_set(
+                    pasos[paso][0],
+                    pasos[paso][1],
+                    pasos[paso][2],
+                    pasos[paso][3]
+                );
+            }
+        }
+
+        int64_t ahora_print = esp_timer_get_time();
+        if (ahora_print - last_print >= 1000000)
+        {
+        last_print = ahora_print;
+
+        const char *dir_str = (direccion == 1) ? "ANTIHORARIO" : "HORARIO";
+        printf("T=%.1f C | Tc=%.1f C | Luz=%d%% | LED=%d%% | Motor=%d s/s (%s)\n",
+           temp,
+           temp_control,
+           luz,
+           led_percent,
+           steps_s,
+           dir_str);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}

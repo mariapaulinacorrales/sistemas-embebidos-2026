@@ -1,0 +1,44 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "DAC_PWM",
+			"path": "../../PlatformIO/Projects/DAC_PWM"
+		},
+		{
+			"name": "Bonus_SE",
+			"path": "../../PlatformIO/Projects/Bonus_SE"
+		},
+		{
+			"name": "EJ_1_UART",
+			"path": "../../PlatformIO/Projects/EJ_1_UART"
+		},
+		{
+			"name": "Ejercicio_Tipo_Final",
+			"path": "../../PlatformIO/Projects/Ejercicio_Tipo_Final"
+		},
+		{
+			"name": "EJ_SPI",
+			"path": "../../PlatformIO/Projects/EJ_SPI"
+		},
+		{
+			"name": "EJ1_ADC",
+			"path": "../../PlatformIO/Projects/EJ1_ADC"
+		},
+		{
+			"name": "EJ2_ADC",
+			"path": "../../PlatformIO/Projects/EJ2_ADC"
+		},
+		{
+			"name": "EJ1_PWM",
+			"path": "../../PlatformIO/Projects/EJ1_PWM"
+		},
+		{
+			"name": "EJ_DAC_ONESHOT",
+			"path": "../../PlatformIO/Projects/EJ_DAC_ONESHOT"
+		}
+	],
+	"settings": {}
+}
