@@ -1,0 +1,655 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/spi_master.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/uart.h"
+#include "esp_timer.h"
+#include "esp_task_wdt.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "esp_err.h"
+
+// BLE NimBLE
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "host/ble_gatt.h"
+#include "host/ble_uuid.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+#define PIN_MOSI    23
+#define PIN_MISO    19
+#define PIN_CLK     18
+#define PIN_CS       5
+#define PIN_RST      4
+
+#define I2C_PORT    I2C_NUM_0
+#define I2C_SDA     GPIO_NUM_21
+#define I2C_SCL     GPIO_NUM_22
+
+#define PIN_LED_ROJO    25
+#define PIN_LED_VERDE   26
+#define PIN_LED_AZUL    27
+#define PIN_BUZZER      32
+
+// ================================================================
+// CONSTANTES I2C
+// ================================================================
+#define DS1307_ADDR  0x68
+#define LCD_ADDR     0x27
+
+// ================================================================
+// BLE
+// ================================================================
+#define DEVICE_NAME "PanelHMI"
+
+// ================================================================
+// UIDs AUTORIZADOS 
+// ================================================================
+#define NUM_UIDS 2
+static const uint8_t UIDS_AUTH[NUM_UIDS][4] = {
+    {0xBB, 0xC1, 0x42, 0x0B},
+};
+
+// ================================================================
+// ESTADOS
+// ================================================================
+#define ESTADO_BLOQUEADO  0
+#define ESTADO_ACTIVO     1
+static volatile int estado = ESTADO_BLOQUEADO;
+static char mensaje_lcd[17] = "Sin mensajes    ";
+
+// ================================================================
+// BLE UUIDs NUS
+// ================================================================
+static const ble_uuid128_t nus_svc_uuid =
+    BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,
+                     0x93,0xf3,0xa3,0xb5,0x01,0x00,0x40,0x6e);
+static const ble_uuid128_t nus_rx_uuid =
+    BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,
+                     0x93,0xf3,0xa3,0xb5,0x02,0x00,0x40,0x6e);
+static const ble_uuid128_t nus_tx_uuid =
+    BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,
+                     0x93,0xf3,0xa3,0xb5,0x03,0x00,0x40,0x6e);
+
+static uint8_t  own_addr_type;
+static uint16_t ble_conn_handle    = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t nus_tx_val_handle;
+static bool     ble_notify_enabled = false;
+
+#define CommandReg      0x01
+#define ComIrqReg       0x04
+#define ErrorReg        0x06
+#define FIFODataReg     0x09
+#define FIFOLevelReg    0x0A
+#define ControlReg      0x0C
+#define BitFramingReg   0x0D
+#define ModeReg         0x11
+#define TxControlReg    0x14
+#define TxASKReg        0x15
+#define TModeReg        0x2A
+#define TPrescalerReg   0x2B
+#define TReloadRegH     0x2C
+#define TReloadRegL     0x2D
+#define VersionReg      0x37
+
+#define PCD_IDLE        0x00
+#define PCD_TRANSCEIVE  0x0C
+#define PCD_SOFTRESET   0x0F
+
+#define PICC_REQALL     0x52
+#define PICC_ANTICOLL   0x93
+
+static spi_device_handle_t rc522_spi;
+
+// ================================================================
+// FUNCIONES RC522
+// ================================================================
+static void rc522_write_reg(uint8_t reg, uint8_t value) {
+    uint8_t tx[2] = { (reg << 1) & 0x7E, value };
+    spi_transaction_t t = { .length = 16, .tx_buffer = tx };
+    spi_device_transmit(rc522_spi, &t);
+}
+
+static uint8_t rc522_read_reg(uint8_t reg) {
+    uint8_t tx[2] = { ((reg << 1) & 0x7E) | 0x80, 0x00 };
+    uint8_t rx[2] = {0};
+    spi_transaction_t t = { .length = 16, .tx_buffer = tx, .rx_buffer = rx };
+    spi_device_transmit(rc522_spi, &t);
+    return rx[1];
+}
+
+static void rc522_set_bit_mask(uint8_t reg, uint8_t mask) {
+    uint8_t temp = rc522_read_reg(reg);
+    rc522_write_reg(reg, temp | mask);
+}
+
+static void rc522_clear_bit_mask(uint8_t reg, uint8_t mask) {
+    uint8_t temp = rc522_read_reg(reg);
+    rc522_write_reg(reg, temp & (~mask));
+}
+
+static void rc522_reset(void) {
+    gpio_set_direction(PIN_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_set_level(PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    rc522_write_reg(CommandReg, PCD_SOFTRESET);
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+static void rc522_antenna_on(void) {
+    uint8_t temp = rc522_read_reg(TxControlReg);
+    if (!(temp & 0x03)) {
+        rc522_set_bit_mask(TxControlReg, 0x03);
+    }
+}
+
+void rc522_init(void) {
+    rc522_reset();
+    rc522_write_reg(TModeReg, 0x8D);
+    rc522_write_reg(TPrescalerReg, 0x3E);
+    rc522_write_reg(TReloadRegL, 30);
+    rc522_write_reg(TReloadRegH, 0);
+    rc522_write_reg(TxASKReg, 0x40);
+    rc522_write_reg(ModeReg, 0x3D);
+    rc522_antenna_on();
+}
+
+static int rc522_to_card(uint8_t command, uint8_t *sendData, uint8_t sendLen,
+                         uint8_t *backData, uint16_t *backLen) {
+    uint8_t waitIRq = (command == PCD_TRANSCEIVE) ? 0x30 : 0x00;
+    rc522_write_reg(ComIrqReg, 0x7F);
+    rc522_set_bit_mask(FIFOLevelReg, 0x80);
+    rc522_write_reg(CommandReg, PCD_IDLE);
+    
+    for (int i = 0; i < sendLen; i++) {
+        rc522_write_reg(FIFODataReg, sendData[i]);
+    }
+    
+    rc522_write_reg(CommandReg, command);
+    if (command == PCD_TRANSCEIVE) {
+        rc522_set_bit_mask(BitFramingReg, 0x80);
+    }
+    
+    uint16_t i = 5000;
+    uint8_t n;
+    do {
+        n = rc522_read_reg(ComIrqReg);
+        i--;
+    } while ((i != 0) && !(n & 0x01) && !(n & waitIRq));
+    
+    rc522_clear_bit_mask(BitFramingReg, 0x80);
+    if (i == 0) return 0;
+    if (rc522_read_reg(ErrorReg) & 0x1B) return 0;
+    
+    if (command == PCD_TRANSCEIVE) {
+        n = rc522_read_reg(FIFOLevelReg);
+        uint8_t lastBits = rc522_read_reg(ControlReg) & 0x07;
+        if (lastBits) *backLen = (n - 1) * 8 + lastBits;
+        else *backLen = n * 8;
+        if (n > 16) n = 16;
+        for (i = 0; i < n; i++) {
+            backData[i] = rc522_read_reg(FIFODataReg);
+        }
+    }
+    return 1;
+}
+
+static int rc522_request(uint8_t reqMode, uint8_t *TagType) {
+    uint16_t backBits;
+    uint8_t buffer[1] = { reqMode };
+    rc522_write_reg(BitFramingReg, 0x07);
+    int status = rc522_to_card(PCD_TRANSCEIVE, buffer, 1, TagType, &backBits);
+    return (status == 1 && backBits == 0x10) ? 1 : 0;
+}
+
+static int rc522_anticoll(uint8_t *serNum) {
+    uint16_t unLen;
+    uint8_t buffer[2] = { PICC_ANTICOLL, 0x20 };
+    rc522_write_reg(BitFramingReg, 0x00);
+    int status = rc522_to_card(PCD_TRANSCEIVE, buffer, 2, serNum, &unLen);
+    if (status) {
+        uint8_t check = 0;
+        for (int i = 0; i < 4; i++) check ^= serNum[i];
+        if (check != serNum[4]) return 0;
+        return 1;
+    }
+    return 0;
+}
+
+uint8_t rc522_read_uid(uint8_t *uid) {
+    uint8_t tagType[2];
+    if (!rc522_request(PICC_REQALL, tagType)) return 0;
+    uint8_t uid_temp[5];
+    if (!rc522_anticoll(uid_temp)) return 0;
+    memcpy(uid, uid_temp, 4);
+    return 1;
+}
+
+int uid_autorizado(uint8_t *uid) {
+    for (int i = 0; i < NUM_UIDS; i++)
+        if (memcmp(uid, UIDS_AUTH[i], 4) == 0) return 1;
+    return 0;
+}
+
+// ================================================================
+// I2C — DS1307 (RTC)
+// ================================================================
+uint8_t bcd_a_dec(uint8_t b) { return ((b >> 4) * 10) + (b & 0x0F); }
+uint8_t dec_a_bcd(uint8_t d) { return ((d / 10) << 4) | (d % 10); }
+
+void ds1307_set_time(uint8_t h, uint8_t m, uint8_t s) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS1307_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);
+    i2c_master_write_byte(cmd, dec_a_bcd(s) & 0x7F, true);
+    i2c_master_write_byte(cmd, dec_a_bcd(m), true);
+    i2c_master_write_byte(cmd, dec_a_bcd(h), true);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+}
+
+void ds1307_get(uint8_t *h, uint8_t *m, uint8_t *s) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS1307_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x00, true);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    
+    uint8_t d[3];
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS1307_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, &d[0], I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, &d[1], I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, &d[2], I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    
+    *s = bcd_a_dec(d[0] & 0x7F);
+    *m = bcd_a_dec(d[1]);
+    *h = bcd_a_dec(d[2] & 0x3F);
+}
+
+// ================================================================
+// I2C — LCD 16x2
+// ================================================================
+#define LCD_BL  0x08
+#define LCD_EN  0x04
+#define LCD_RS  0x01
+
+void lcd_i2c_write(uint8_t data) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (LCD_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, data, true);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(20));
+    i2c_cmd_link_delete(cmd);
+}
+
+void lcd_nibble(uint8_t nibble, uint8_t mode) {
+    uint8_t d = (nibble & 0xF0) | mode | LCD_BL;
+    lcd_i2c_write(d | LCD_EN);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    lcd_i2c_write(d & ~LCD_EN);
+    vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+void lcd_byte(uint8_t byte, uint8_t mode) {
+    lcd_nibble(byte & 0xF0, mode);
+    lcd_nibble((byte << 4) & 0xF0, mode);
+}
+
+void lcd_init(void) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    for (int i = 0; i < 3; i++) {
+        lcd_nibble(0x30, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    lcd_nibble(0x20, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    lcd_byte(0x28, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    lcd_byte(0x0C, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    lcd_byte(0x01, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcd_byte(0x06, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+void lcd_cursor(uint8_t fila, uint8_t col) {
+    lcd_byte((fila == 0 ? 0x80 : 0xC0) + col, 0);
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+void lcd_char(char c) {
+    lcd_byte(c, LCD_RS);
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+void lcd_str(const char *s) {
+    while (*s) lcd_char(*s++);
+}
+
+void lcd_clear(void) {
+    lcd_byte(0x01, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+void lcd_show(const char *l1, const char *l2) {
+    lcd_cursor(0, 0); lcd_str(l1);
+    lcd_cursor(1, 0); lcd_str(l2);
+}
+
+// ================================================================
+// ACTUADORES
+// ================================================================
+void led_r(int v) { gpio_set_level(PIN_LED_ROJO, v); }
+void led_g(int v) { gpio_set_level(PIN_LED_VERDE, v); }
+void led_b(int v) { gpio_set_level(PIN_LED_AZUL, v); }
+
+void buzzer_on(int hz) {
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_1, hz);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 512);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
+void buzzer_off(void) {
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
+void buzzer_corto(void) {
+    buzzer_on(2000); vTaskDelay(pdMS_TO_TICKS(500)); buzzer_off();
+}
+void buzzer_largo(void) {
+    buzzer_on(800); vTaskDelay(pdMS_TO_TICKS(2000)); buzzer_off();
+}
+void led_r_parpadear(void) {
+    for (int i = 0; i < 3; i++) {
+        led_r(0); vTaskDelay(pdMS_TO_TICKS(200));
+        led_r(1); vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// ================================================================
+// BLE NUS
+// ================================================================
+void ble_nus_send(const char *msg) {
+    if (ble_conn_handle == BLE_HS_CONN_HANDLE_NONE || !ble_notify_enabled) return;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(msg, strlen(msg));
+    if (om) ble_gatts_notify_custom(ble_conn_handle, nus_tx_val_handle, om);
+}
+
+static int nus_rx_cb(uint16_t ch, uint16_t ah, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    uint8_t data[17]; uint16_t len = 0;
+    ble_hs_mbuf_to_flat(ctxt->om, data, 16, &len);
+    data[len] = '\0';
+    if (estado == ESTADO_ACTIVO) {
+        strncpy(mensaje_lcd, (char *)data, 16);
+        mensaje_lcd[16] = '\0';
+        for (int i = strlen(mensaje_lcd); i < 16; i++) mensaje_lcd[i] = ' ';
+        ble_nus_send("MSG OK\n");
+    } else {
+        ble_nus_send("PANEL BLOQUEADO\n");
+    }
+    return 0;
+}
+
+static int nus_tx_cb(uint16_t ch, uint16_t ah, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    return 0;
+}
+
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    { .type = BLE_GATT_SVC_TYPE_PRIMARY, .uuid = &nus_svc_uuid.u,
+      .characteristics = (struct ble_gatt_chr_def[]) {
+            { .uuid = &nus_rx_uuid.u, .access_cb = nus_rx_cb,
+              .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP },
+            { .uuid = &nus_tx_uuid.u, .access_cb = nus_tx_cb,
+              .val_handle = &nus_tx_val_handle, .flags = BLE_GATT_CHR_F_NOTIFY },
+            { 0 }
+      } },
+    { 0 }
+};
+
+static void ble_advertise(void);
+static int ble_gap_cb(struct ble_gap_event *ev, void *arg) {
+    switch (ev->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (ev->connect.status == 0) ble_conn_handle = ev->connect.conn_handle;
+            else ble_advertise();
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            ble_notify_enabled = false;
+            ble_advertise();
+            break;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            if (ev->subscribe.attr_handle == nus_tx_val_handle)
+                ble_notify_enabled = ev->subscribe.cur_notify;
+            break;
+        case BLE_GAP_EVENT_ADV_COMPLETE:
+            ble_advertise();
+            break;
+        default: break;
+    }
+    return 0;
+}
+
+static void ble_advertise(void) {
+    struct ble_hs_adv_fields f, r;
+    struct ble_gap_adv_params p;
+    memset(&f, 0, sizeof(f));
+    f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    f.uuids128 = (ble_uuid128_t *)&nus_svc_uuid;
+    f.num_uuids128 = 1;
+    f.uuids128_is_complete = 1;
+    ble_gap_adv_set_fields(&f);
+    
+    memset(&r, 0, sizeof(r));
+    const char *name = ble_svc_gap_device_name();
+    r.name = (uint8_t *)name;
+    r.name_len = strlen(name);
+    r.name_is_complete = 1;
+    ble_gap_adv_rsp_set_fields(&r);
+    
+    memset(&p, 0, sizeof(p));
+    p.conn_mode = BLE_GAP_CONN_MODE_UND;
+    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &p, ble_gap_cb, NULL);
+}
+
+static void ble_on_sync(void) {
+    ble_hs_id_infer_auto(0, &own_addr_type);
+    ble_advertise();
+}
+static void ble_host_task(void *param) {
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+void tarea_sistema(void *param) {
+    uint8_t uid[4];
+    uint8_t uid_ant[4] = {0};
+    int64_t t_ultima_lectura = 0;
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+    lcd_clear();
+    lcd_show("Panel bloqueado ", "Acerque credenc.");
+    led_r(1); led_g(0); led_b(0);
+    
+    while (1) {
+        // Leer hora del RTC
+        uint8_t h, m, s;
+        ds1307_get(&h, &m, &s);
+        char hora[12];
+        snprintf(hora, sizeof(hora), "%02d:%02d:%02d", h, m, s);
+        
+        // Actualizar LCD si está ACTIVO
+        if (estado == ESTADO_ACTIVO) {
+            lcd_cursor(0, 0); lcd_str(mensaje_lcd);
+            lcd_cursor(1, 0); lcd_str(hora);
+            for (int i = strlen(hora); i < 16; i++) lcd_str(" ");
+        }
+        
+        uint8_t tagType[2];
+        if (rc522_request(PICC_REQALL, tagType)) {
+            uint8_t uid_temp[5];
+            if (rc522_anticoll(uid_temp)) {
+                memcpy(uid, uid_temp, 4);
+                int64_t ahora_ms = esp_timer_get_time() / 1000;
+                
+                if (memcmp(uid, uid_ant, 4) != 0 || (ahora_ms - t_ultima_lectura) > 2000) {
+                    memcpy(uid_ant, uid, 4);
+                    t_ultima_lectura = ahora_ms;
+                    
+                    printf("UID leido: %02X:%02X:%02X:%02X\n", uid[0], uid[1], uid[2], uid[3]);
+                    
+                    if (uid_autorizado(uid)) {
+                        if (estado == ESTADO_BLOQUEADO) {
+                            lcd_clear();
+                            lcd_show("Acceso concedido", hora);
+                            led_r(0); led_g(1);
+                            buzzer_corto();
+                            vTaskDelay(pdMS_TO_TICKS(1000));
+                            led_g(0);
+                            estado = ESTADO_ACTIVO;
+                            led_b(1);
+                            strcpy(mensaje_lcd, "Sin mensajes    ");
+                            lcd_clear();
+                            lcd_show(mensaje_lcd, hora);
+                        } else {
+                            estado = ESTADO_BLOQUEADO;
+                            led_b(0); led_r(1);
+                            buzzer_corto();
+                            lcd_clear();
+                            lcd_show("Panel bloqueado ", "Acerque credenc.");
+                        }
+                    } else {
+                        if (estado == ESTADO_BLOQUEADO) {
+                            lcd_clear();
+                            lcd_show("Acceso denegado ", "UID no registrad");
+                            led_r_parpadear();
+                            buzzer_largo();
+                            vTaskDelay(pdMS_TO_TICKS(2000));
+                            lcd_clear();
+                            lcd_show("Panel bloqueado ", "Acerque credenc.");
+                            led_r(1);
+                        }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+void app_main(void) {
+    
+    // Configurar UART
+    uart_config_t uart_cfg = {
+        .baud_rate = 115200, .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT
+    };
+    uart_param_config(UART_NUM_0, &uart_cfg);
+    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+    
+    // NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    
+    // LEDs
+    gpio_config_t led_cfg = {
+        .pin_bit_mask = (1ULL<<PIN_LED_ROJO)|(1ULL<<PIN_LED_VERDE)|(1ULL<<PIN_LED_AZUL),
+        .mode = GPIO_MODE_OUTPUT, .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&led_cfg);
+    led_r(0); led_g(0); led_b(0);
+    
+    // Buzzer PWM
+    ledc_timer_config_t bt = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_1,
+        .duty_resolution = 10, .freq_hz = 2000, .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&bt);
+    ledc_channel_config_t bc = {
+        .gpio_num = PIN_BUZZER, .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_1, .duty = 0, .hpoint = 0
+    };
+    ledc_channel_config(&bc);
+    
+    // RC522 SPI
+    gpio_config_t rst_cfg = {
+        .pin_bit_mask = (1ULL << PIN_RST), .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&rst_cfg);
+    gpio_set_level(PIN_RST, 1);
+    
+    spi_bus_config_t spi_bus = {
+        .mosi_io_num = PIN_MOSI, .miso_io_num = PIN_MISO, .sclk_io_num = PIN_CLK,
+        .quadhd_io_num = -1, .quadwp_io_num = -1
+    };
+    spi_bus_initialize(SPI2_HOST, &spi_bus, SPI_DMA_CH_AUTO);
+    
+    spi_device_interface_config_t rc522_dev = {
+        .clock_speed_hz = 1000000, .mode = 0,
+        .spics_io_num = PIN_CS, .queue_size = 7
+    };
+    spi_bus_add_device(SPI2_HOST, &rc522_dev, &rc522_spi);
+    rc522_init();
+    
+    // I2C (LCD + RTC)
+    i2c_config_t i2c_conf = {
+        .mode = I2C_MODE_MASTER, .sda_io_num = I2C_SDA, .scl_io_num = I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE, .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 50000
+    };
+    i2c_param_config(I2C_PORT, &i2c_conf);
+    i2c_driver_install(I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    
+    lcd_init();
+    
+    ds1307_set_time(15, 45, 0); 
+    
+    // BLE
+    nimble_port_init();
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_svc_gap_device_name_set(DEVICE_NAME);
+    ble_gatts_count_cfg(gatt_svcs);
+    ble_gatts_add_svcs(gatt_svcs);
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    nimble_port_freertos_init(ble_host_task);
+    
+    printf("\n=== PANEL HMI INDUSTRIAL ===\n");
+    printf("BLE: %s\n", DEVICE_NAME);
+    printf("UIDs autorizados:\n");
+    for (int i = 0; i < NUM_UIDS; i++) {
+        printf("  %02X:%02X:%02X:%02X\n", UIDS_AUTH[i][0], UIDS_AUTH[i][1], UIDS_AUTH[i][2], UIDS_AUTH[i][3]);
+    }
+    
+    // Tarea principal en core 1
+    xTaskCreatePinnedToCore(tarea_sistema, "sistema", 4096, NULL, 5, NULL, 1);
+}
